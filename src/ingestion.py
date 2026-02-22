@@ -6,7 +6,8 @@ import cartopy.feature as cfeature
 import rasterio
 from matplotlib.lines import Line2D
 from scipy.stats import pearsonr
-
+import matplotlib.colors as mcolors
+import calendar
 
 def compute_summary_stats(da, name):
     """Compute key summary statistics for a DataArray."""
@@ -604,3 +605,331 @@ def plot_top_cells_bar(df_top, n=10, save_path=None):
     if save_path:
         plt.savefig(save_path, dpi=200, bbox_inches='tight')
     plt.show()
+
+def create_monthly_animation(t2mwet_c, lats, lons, save_path='q5_heat_animation.gif',
+                              metric='mean_hours_above_25', fps=1.5):
+    """
+    Create a 12-frame animation showing monthly evolution of heat stress.
+    
+    Parameters
+    ----------
+    t2mwet_c : xarray DataArray (time, lat, lon) in °C
+    lats, lons : 1D coordinate arrays
+    save_path : str — output file (.gif or .mp4)
+    metric : str — 'mean_twet' for monthly mean T2MWET,
+                    'mean_hours_above_25' for monthly mean daily hours ≥25°C
+    fps : float — frames per second
+    """
+    import matplotlib.animation as mpl_animation
+    
+    print(f"Computing monthly fields (metric: {metric})...")
+    
+    monthly_data = []
+    for month in range(1, 13):
+        month_mask = t2mwet_c.time.dt.month == month
+        t2mwet_month = t2mwet_c.sel(time=month_mask)
+        
+        if metric == 'mean_twet':
+            field = t2mwet_month.mean(dim='time').values
+        elif metric == 'mean_hours_above_25':
+            # Mean daily hours ≥25°C for this month
+            daily_hours = (t2mwet_month >= 25).resample(time='1D').sum()
+            field = daily_hours.mean(dim='time').values
+        else:
+            field = t2mwet_month.mean(dim='time').values
+        
+        monthly_data.append(field)
+        print(f"  {calendar.month_abbr[month]}: range [{np.nanmin(field):.1f}, {np.nanmax(field):.1f}]")
+    
+    # Fixed color scale across all frames
+    if metric == 'mean_twet':
+        vmin, vmax = -15, 30
+        cmap = 'RdYlBu_r'
+        cbar_label = 'Monthly Mean T2MWET (°C)'
+        threshold_line = 25  # Moderate threshold for visual cue
+    else:
+        vmin, vmax = 0, 24
+        cmap = 'YlOrRd'
+        cbar_label = 'Mean Daily Hours ≥ 25°C'
+        threshold_line = None
+    
+    # Create animation
+    fig, ax = plt.subplots(figsize=(10, 7),
+                           subplot_kw={'projection': ccrs.PlateCarree()})
+    
+    def init():
+        ax.clear()
+        return []
+    
+    def animate(frame_idx):
+        ax.clear()
+        data = monthly_data[frame_idx]
+        month_name = calendar.month_name[frame_idx + 1]
+        
+        mesh = ax.pcolormesh(lons, lats, data, transform=ccrs.PlateCarree(),
+                            cmap=cmap, vmin=vmin, vmax=vmax, shading='auto')
+        
+        # Add threshold contour if applicable
+        if metric == 'mean_twet' and threshold_line is not None:
+            try:
+                ax.contour(lons, lats, data, levels=[threshold_line],
+                          colors='black', linewidths=1.5, linestyles='--',
+                          transform=ccrs.PlateCarree())
+            except Exception:
+                pass
+        
+        ax.add_feature(cfeature.COASTLINE, linewidth=0.8)
+        ax.add_feature(cfeature.BORDERS, linewidth=0.5, linestyle=':')
+        ax.set_extent([60, 100, 5, 35], crs=ccrs.PlateCarree())
+        
+        gl = ax.gridlines(draw_labels=True, linewidth=0.3, color='gray', alpha=0.5)
+        gl.top_labels = False
+        gl.right_labels = False
+        
+        ax.set_title(f'Heat Stress — {month_name} 2024', fontsize=14, fontweight='bold')
+        
+        return [mesh]
+    
+    anim = mpl_animation.FuncAnimation(fig, animate, init_func=init,
+                                        frames=12, interval=1000/fps, blit=False)
+    
+    # Add colorbar (static)
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=mcolors.Normalize(vmin=vmin, vmax=vmax))
+    sm.set_array([])
+    cbar = plt.colorbar(sm, ax=ax, orientation='horizontal', pad=0.08,
+                        shrink=0.8, extend='max')
+    cbar.set_label(cbar_label)
+    
+    print(f"\nSaving animation to {save_path}...")
+    if save_path.endswith('.gif'):
+        anim.save(save_path, writer='pillow', fps=fps, dpi=150)
+    else:
+        anim.save(save_path, writer='ffmpeg', fps=fps, dpi=150)
+    
+    plt.close(fig)
+    print("Done.")
+    
+    return monthly_data
+
+def compute_monthly_person_hours(t2mwet_c, pop_on_merra, high_thresh=28):
+    """
+    Compute person-hours of High risk for each month separately.
+    
+    Returns
+    -------
+    monthly_ph : dict {month_num: 2D array of person-hours per cell}
+    monthly_totals : dict {month_num: total person-hours for that month}
+    """
+    monthly_ph = {}
+    monthly_totals = {}
+    
+    print("Computing monthly person-hours...")
+    for month in range(1, 13):
+        month_mask = t2mwet_c.time.dt.month == month
+        t2mwet_month = t2mwet_c.sel(time=month_mask)
+        
+        hours_high = (t2mwet_month >= high_thresh).sum(dim='time').values.astype(float)
+        ph = pop_on_merra * hours_high
+        total = np.sum(ph)
+        
+        monthly_ph[month] = ph
+        monthly_totals[month] = total
+        
+        if total > 0:
+            print(f"  {calendar.month_abbr[month]}: {total:.2e} person-hours")
+    
+    return monthly_ph, monthly_totals
+
+def select_deployments(monthly_ph, monthly_totals, pop_on_merra,
+                        lats, lons, n_deployments=5,
+                        min_spatial_gap=1.5):
+    """
+    Select optimal deployment locations and times to maximize coverage.
+    
+    Strategy: Greedy selection — pick the (cell, month) combination with the 
+    highest person-hours, then exclude nearby cells from the same month to 
+    ensure spatial diversity, and repeat.
+    
+    Parameters
+    ----------
+    monthly_ph : dict from compute_monthly_person_hours()
+    monthly_totals : dict of total person-hours per month
+    pop_on_merra : 2D array of population
+    lats, lons : coordinate arrays
+    n_deployments : int — number of deployments available
+    min_spatial_gap : float — minimum distance in degrees between deployments
+                      in the same month (to ensure spatial diversity)
+    
+    Returns
+    -------
+    deployments : list of dicts with deployment details
+    """
+    # Build a ranked list of all (cell, month) combinations
+    candidates = []
+    for month in range(1, 13):
+        ph = monthly_ph[month]
+        for i in range(len(lats)):
+            for j in range(len(lons)):
+                if ph[i, j] > 0:
+                    candidates.append({
+                        'lat': lats[i],
+                        'lon': lons[j],
+                        'lat_idx': i,
+                        'lon_idx': j,
+                        'month': month,
+                        'month_name': calendar.month_abbr[month],
+                        'person_hours': ph[i, j],
+                        'population': pop_on_merra[i, j],
+                        'hours_ge28': ph[i, j] / max(pop_on_merra[i, j], 1),
+                    })
+    
+    candidates.sort(key=lambda x: x['person_hours'], reverse=True)
+    
+    # Greedy selection with spatial diversity constraint
+    selected = []
+    used_cells = set()  # Track (lat_idx, lon_idx, month) to avoid duplicates
+    
+    for cand in candidates:
+        if len(selected) >= n_deployments:
+            break
+        
+        key = (cand['lat_idx'], cand['lon_idx'], cand['month'])
+        if key in used_cells:
+            continue
+        
+        # Check spatial gap from already-selected deployments in same month
+        too_close = False
+        for sel in selected:
+            if sel['month'] == cand['month']:
+                dist = np.sqrt((sel['lat'] - cand['lat'])**2 + 
+                              (sel['lon'] - cand['lon'])**2)
+                if dist < min_spatial_gap:
+                    too_close = True
+                    break
+        
+        if too_close:
+            continue
+        
+        selected.append(cand)
+        used_cells.add(key)
+    
+    # Print summary
+    total_covered = sum(d['person_hours'] for d in selected)
+    total_all = sum(monthly_totals.values())
+    
+    print(f"\n{'='*80}")
+    print(f"RECOMMENDED DEPLOYMENTS ({n_deployments} teams)")
+    print(f"{'='*80}")
+    print(f"{'#':<4} {'Month':<8} {'Location':>20} {'Population':>14} "
+          f"{'Hours≥28°C':>12} {'Person-Hours':>16}")
+    print(f"{'-'*80}")
+    
+    for i, d in enumerate(selected):
+        print(f"{i+1:<4} {d['month_name']:<8} "
+              f"{d['lat']:.1f}°N, {d['lon']:.1f}°E{' ':>4} "
+              f"{d['population']:>14,.0f} {d['hours_ge28']:>12.0f} "
+              f"{d['person_hours']:>16,.0f}")
+    
+    print(f"{'-'*80}")
+    print(f"Total person-hours covered by deployments: {total_covered:,.0f}")
+    print(f"Total person-hours across all cells/months: {total_all:,.0f}")
+    print(f"Coverage: {100*total_covered/total_all:.1f}%")
+    print(f"{'='*80}")
+    
+    return selected
+
+def plot_deployment_recommendation(selected, monthly_ph, lats, lons,
+                                    save_path=None):
+    """
+    Create a single decision-maker-friendly visualization showing
+    the 5 recommended deployments on a map with a timeline.
+    """
+    fig = plt.figure(figsize=(16, 10))
+    
+    # Main map (left, larger)
+    ax_map = fig.add_axes([0.05, 0.15, 0.55, 0.75],
+                          projection=ccrs.PlateCarree())
+    
+    # Timeline (right)
+    ax_timeline = fig.add_axes([0.65, 0.15, 0.32, 0.75])
+    
+    # --- MAP ---
+    # Show total annual person-hours as background
+    total_ph = sum(monthly_ph.values())
+    total_ph_log = np.log10(np.clip(total_ph, 1, None))
+    
+    mesh = ax_map.pcolormesh(lons, lats, total_ph_log, transform=ccrs.PlateCarree(),
+                             cmap='YlOrRd', vmin=0, vmax=10, shading='auto', alpha=0.6)
+    
+    ax_map.add_feature(cfeature.COASTLINE, linewidth=0.8)
+    ax_map.add_feature(cfeature.BORDERS, linewidth=0.5, linestyle=':')
+    ax_map.set_extent([60, 100, 5, 35], crs=ccrs.PlateCarree())
+    
+    gl = ax_map.gridlines(draw_labels=True, linewidth=0.3, color='gray', alpha=0.5)
+    gl.top_labels = False
+    gl.right_labels = False
+    
+    # Plot deployment markers
+    colors_deploy = ['#e41a1c', '#377eb8', '#4daf4a', '#984ea3', '#ff7f00']
+    
+    for i, d in enumerate(selected):
+        ax_map.plot(d['lon'], d['lat'], marker='*', markersize=20,
+                   color=colors_deploy[i], markeredgecolor='black',
+                   markeredgewidth=1.5, transform=ccrs.PlateCarree(),
+                   zorder=10)
+        ax_map.annotate(f"  {i+1}", (d['lon'], d['lat']),
+                       transform=ccrs.PlateCarree(),
+                       fontsize=12, fontweight='bold', color=colors_deploy[i],
+                       zorder=11)
+    
+    cbar = plt.colorbar(mesh, ax=ax_map, orientation='horizontal', pad=0.08,
+                        shrink=0.7, extend='max')
+    cbar.set_label('Annual Person-Hours (log₁₀ scale)', fontsize=10)
+    
+    ax_map.set_title('Recommended Deployment Locations', fontsize=14, fontweight='bold')
+    
+    # --- TIMELINE ---
+    total_covered = sum(d['person_hours'] for d in selected)
+    
+    for i, d in enumerate(selected):
+        # Bar for each deployment
+        ax_timeline.barh(i, d['person_hours'], color=colors_deploy[i],
+                        edgecolor='black', linewidth=0.8, height=0.6)
+        
+        # Label
+        label = f"#{i+1}: {d['month_name']}\n{d['lat']:.1f}°N, {d['lon']:.1f}°E"
+        ax_timeline.text(-total_covered * 0.02, i, label,
+                        ha='right', va='center', fontsize=9, fontweight='bold')
+        
+        # Value annotation
+        ax_timeline.text(d['person_hours'] * 1.02, i,
+                        f"{d['person_hours']/1e9:.2f}B",
+                        ha='left', va='center', fontsize=9)
+    
+    ax_timeline.set_xlabel('Person-Hours of High Risk Covered', fontsize=10)
+    ax_timeline.set_title('Impact per Deployment', fontsize=12, fontweight='bold')
+    ax_timeline.set_yticks([])
+    ax_timeline.invert_yaxis()
+    ax_timeline.ticklabel_format(axis='x', style='scientific', scilimits=(0, 0))
+    ax_timeline.grid(axis='x', alpha=0.3)
+    
+    # Takeaway message
+    total_all = sum(sum(ph.ravel()) for ph in monthly_ph.values())
+    coverage_pct = 100 * total_covered / total_all
+    
+    fig.text(0.5, 0.04,
+             f"TAKEAWAY: These 5 deployments cover {total_covered/1e9:.1f} billion "
+             f"person-hours of dangerous heat exposure ({coverage_pct:.1f}% of total). "
+             f"Bangladesh and eastern India are the top priority.",
+             ha='center', fontsize=11, fontweight='bold',
+             bbox=dict(boxstyle='round,pad=0.5', facecolor='lightyellow',
+                      edgecolor='orange', alpha=0.9))
+    
+    fig.suptitle('Heat-Health Deployment Recommendations — South Asia, 2024',
+                 fontsize=15, fontweight='bold', y=0.97)
+    
+    if save_path:
+        plt.savefig(save_path, dpi=200, bbox_inches='tight')
+    plt.show()
+    
+    return fig
