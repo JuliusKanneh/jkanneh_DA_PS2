@@ -298,3 +298,394 @@ def print_q2_summary(annual_p95_t2mwet, annual_mean_t2m, elev_on_merra,
         print(f"\nHigh-elevation cells (>2000m): n={np.sum(high_mask)}")
         print(f"  Mean P95 T2MWET: {np.mean(pv[high_mask]):.2f}°C")
         print(f"  Max P95 T2MWET:  {np.max(pv[high_mask]):.2f}°C")
+
+
+# =====================================================================
+# Q3 ADDITIONS — paste these into your ingestion.py
+# =====================================================================
+# Additional imports needed at top of ingestion.py (if not already there):
+#   import pandas as pd
+#   import xarray as xr
+#   import calendar
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import matplotlib.patches as mpatches
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+import calendar
+
+
+# ---- Q3 PART A: Regional Seasonal Analysis ----
+
+def compute_daily_metrics(t2mwet_c, moderate_thresh=25, high_thresh=28, extreme_thresh=30):
+    """
+    Compute daily heat-stress metrics from hourly wet-bulb temperature.
+    
+    Parameters
+    ----------
+    t2mwet_c : xarray DataArray (time, lat, lon) in °C
+    
+    Returns
+    -------
+    dict of xarray DataArrays with keys:
+        'daily_mean', 'daily_max',
+        'hours_moderate', 'hours_high', 'hours_extreme',
+        'hours_moderate_plus', 'hours_high_plus'
+    """
+    print("Computing daily mean T2MWET...")
+    daily_mean = t2mwet_c.resample(time='1D').mean()
+    
+    print("Computing daily max T2MWET...")
+    daily_max = t2mwet_c.resample(time='1D').max()
+    
+    print("Computing daily hours in Moderate band (25-28°C)...")
+    moderate_mask = (t2mwet_c >= moderate_thresh) & (t2mwet_c < high_thresh)
+    hours_moderate = moderate_mask.resample(time='1D').sum()
+    
+    print("Computing daily hours in High band (28-30°C)...")
+    high_mask = (t2mwet_c >= high_thresh) & (t2mwet_c < extreme_thresh)
+    hours_high = high_mask.resample(time='1D').sum()
+    
+    print("Computing daily hours in Extreme band (≥30°C)...")
+    extreme_mask = (t2mwet_c >= extreme_thresh)
+    hours_extreme = extreme_mask.resample(time='1D').sum()
+    
+    # Cumulative thresholds (useful for reporting)
+    hours_moderate_plus = (t2mwet_c >= moderate_thresh).resample(time='1D').sum()
+    hours_high_plus = (t2mwet_c >= high_thresh).resample(time='1D').sum()
+    
+    print("Done — daily metrics computed.")
+    
+    return {
+        'daily_mean': daily_mean,
+        'daily_max': daily_max,
+        'hours_moderate': hours_moderate,
+        'hours_high': hours_high,
+        'hours_extreme': hours_extreme,
+        'hours_moderate_plus': hours_moderate_plus,
+        'hours_high_plus': hours_high_plus,
+    }
+
+
+def compute_monthly_summary(daily_metrics):
+    """
+    Aggregate daily metrics to monthly summaries (spatial mean across region).
+    
+    Parameters
+    ----------
+    daily_metrics : dict from compute_daily_metrics()
+    
+    Returns
+    -------
+    pandas DataFrame with monthly rows and metric columns
+    """
+    # Spatial mean across all grid cells, then group by month
+    records = []
+    
+    for month in range(1, 13):
+        month_mask = daily_metrics['daily_mean'].time.dt.month == month
+        
+        # Mean across space and time for this month
+        mean_twet = float(daily_metrics['daily_mean'].sel(time=month_mask).mean())
+        max_twet_mean = float(daily_metrics['daily_max'].sel(time=month_mask).mean())
+        max_twet_peak = float(daily_metrics['daily_max'].sel(time=month_mask).max())
+        
+        # Mean daily hours (averaged over space and days in month)
+        hrs_mod = float(daily_metrics['hours_moderate_plus'].sel(time=month_mask).mean())
+        hrs_high = float(daily_metrics['hours_high_plus'].sel(time=month_mask).mean())
+        
+        records.append({
+            'Month': calendar.month_abbr[month],
+            'Month_num': month,
+            'Mean Daily T2MWET (°C)': mean_twet,
+            'Mean Daily Max T2MWET (°C)': max_twet_mean,
+            'Peak Daily Max T2MWET (°C)': max_twet_peak,
+            'Mean Daily Hours ≥25°C': hrs_mod,
+            'Mean Daily Hours ≥28°C': hrs_high,
+        })
+    
+    return pd.DataFrame(records)
+
+
+def plot_monthly_boxplots(daily_metrics, save_path=None):
+    """
+    Monthly boxplots of region-wide daily mean and daily max T2MWET,
+    with risk threshold lines.
+    """
+    # Spatial average per day
+    daily_mean_spatial = daily_metrics['daily_mean'].mean(dim=['lat', 'lon'])
+    daily_max_spatial = daily_metrics['daily_max'].mean(dim=['lat', 'lon'])
+    
+    months = daily_mean_spatial.time.dt.month.values
+    
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    
+    # --- Daily Mean T2MWET ---
+    ax = axes[0]
+    data_by_month = [daily_mean_spatial.values[months == m] for m in range(1, 13)]
+    bp = ax.boxplot(data_by_month, labels=[calendar.month_abbr[m] for m in range(1, 13)],
+                    patch_artist=True, widths=0.6,
+                    boxprops=dict(facecolor='#a8d5e2', alpha=0.7),
+                    medianprops=dict(color='black', linewidth=1.5),
+                    flierprops=dict(markersize=3))
+    ax.axhline(25, color='orange', ls='--', lw=1.5, label='25°C Moderate')
+    ax.axhline(28, color='red', ls='--', lw=1.5, label='28°C High')
+    ax.set_ylabel('Region-Mean Daily Mean T2MWET (°C)')
+    ax.set_title('Daily Mean Wet-Bulb Temperature by Month')
+    ax.legend(fontsize=9)
+    ax.tick_params(axis='x', rotation=45)
+    
+    # --- Daily Max T2MWET ---
+    ax = axes[1]
+    data_by_month = [daily_max_spatial.values[months == m] for m in range(1, 13)]
+    bp = ax.boxplot(data_by_month, labels=[calendar.month_abbr[m] for m in range(1, 13)],
+                    patch_artist=True, widths=0.6,
+                    boxprops=dict(facecolor='#f4a582', alpha=0.7),
+                    medianprops=dict(color='black', linewidth=1.5),
+                    flierprops=dict(markersize=3))
+    ax.axhline(25, color='orange', ls='--', lw=1.5, label='25°C Moderate')
+    ax.axhline(28, color='red', ls='--', lw=1.5, label='28°C High')
+    ax.set_ylabel('Region-Mean Daily Max T2MWET (°C)')
+    ax.set_title('Daily Max Wet-Bulb Temperature by Month')
+    ax.legend(fontsize=9)
+    ax.tick_params(axis='x', rotation=45)
+    
+    plt.suptitle('Seasonal Distribution of Wet-Bulb Temperature Metrics — South Asia, 2024',
+                 fontsize=14, y=1.02)
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=200, bbox_inches='tight')
+    plt.show()
+
+
+def plot_monthly_risk_hours(daily_metrics, save_path=None):
+    """
+    Bar chart showing mean daily hours at Moderate+ and High+ risk by month.
+    """
+    # Spatial average of hours per day, grouped by month
+    hrs_mod = daily_metrics['hours_moderate_plus'].mean(dim=['lat', 'lon'])
+    hrs_high = daily_metrics['hours_high_plus'].mean(dim=['lat', 'lon'])
+    
+    months_arr = hrs_mod.time.dt.month.values
+    
+    monthly_mod = [float(hrs_mod.values[months_arr == m].mean()) for m in range(1, 13)]
+    monthly_high = [float(hrs_high.values[months_arr == m].mean()) for m in range(1, 13)]
+    
+    month_labels = [calendar.month_abbr[m] for m in range(1, 13)]
+    x = np.arange(12)
+    width = 0.35
+    
+    fig, ax = plt.subplots(figsize=(12, 5))
+    bars1 = ax.bar(x - width/2, monthly_mod, width, label='Hours ≥25°C (Moderate+)',
+                   color='#FFA500', alpha=0.8)
+    bars2 = ax.bar(x + width/2, monthly_high, width, label='Hours ≥28°C (High+)',
+                   color='#FF4500', alpha=0.8)
+    
+    ax.set_xlabel('Month')
+    ax.set_ylabel('Mean Daily Hours in Risk Band (region avg)')
+    ax.set_title('Mean Daily Hours of Heat-Risk Exposure by Month — South Asia, 2024')
+    ax.set_xticks(x)
+    ax.set_xticklabels(month_labels)
+    ax.legend()
+    ax.grid(axis='y', alpha=0.3)
+    
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=200, bbox_inches='tight')
+    plt.show()
+
+
+# ---- Q3 PART B: City-Level Analysis ----
+
+# Four representative cities spanning different geographies
+CITIES = {
+    'Delhi':   {'lat': 28.61, 'lon': 77.21, 'desc': 'Inland, Indo-Gangetic Plain'},
+    'Mumbai':  {'lat': 19.08, 'lon': 72.88, 'desc': 'Coastal, Arabian Sea'},
+    'Dhaka':   {'lat': 23.81, 'lon': 90.41, 'desc': 'Riverine delta, Bay of Bengal'},
+    'Karachi': {'lat': 24.86, 'lon': 67.01, 'desc': 'Coastal arid, Arabian Sea'},
+}
+
+
+def extract_city_timeseries(ds_t2m_c, ds_t2mwet_c, cities=None):
+    """
+    Extract nearest-grid-cell time series for each city.
+    
+    Parameters
+    ----------
+    ds_t2m_c : xarray DataArray of T2M in °C
+    ds_t2mwet_c : xarray DataArray of T2MWET in °C
+    cities : dict {name: {lat, lon, desc}} or None for defaults
+    
+    Returns
+    -------
+    dict {city_name: {'t2m': Series, 't2mwet': Series, 'lat_actual': float, 
+                       'lon_actual': float, 'desc': str}}
+    """
+    if cities is None:
+        cities = CITIES
+    
+    city_data = {}
+    for name, info in cities.items():
+        t2m_ts = ds_t2m_c.sel(lat=info['lat'], lon=info['lon'], method='nearest')
+        t2mwet_ts = ds_t2mwet_c.sel(lat=info['lat'], lon=info['lon'], method='nearest')
+        
+        actual_lat = float(t2m_ts.lat)
+        actual_lon = float(t2m_ts.lon)
+        
+        city_data[name] = {
+            't2m': t2m_ts,
+            't2mwet': t2mwet_ts,
+            'lat_actual': actual_lat,
+            'lon_actual': actual_lon,
+            'desc': info.get('desc', ''),
+        }
+        print(f"  {name}: requested ({info['lat']:.2f}°N, {info['lon']:.2f}°E) "
+              f"→ nearest ({actual_lat:.1f}°N, {actual_lon:.2f}°E)")
+    
+    return city_data
+
+
+def plot_city_timeseries(city_data, save_path=None):
+    """
+    Create a 4-panel figure showing daily mean T2M and T2MWET for each city,
+    with risk threshold bands highlighted.
+    
+    Parameters
+    ----------
+    city_data : dict from extract_city_timeseries()
+    """
+    cities = list(city_data.keys())
+    n_cities = len(cities)
+    
+    fig, axes = plt.subplots(n_cities, 1, figsize=(14, 3.5 * n_cities), sharex=True)
+    if n_cities == 1:
+        axes = [axes]
+    
+    for i, (city, data) in enumerate(city_data.items()):
+        ax = axes[i]
+        
+        # Resample to daily mean for smoother time series
+        t2m_daily = data['t2m'].resample(time='1D').mean()
+        t2mwet_daily = data['t2mwet'].resample(time='1D').mean()
+        
+        times = pd.to_datetime(t2m_daily.time.values)
+        
+        # Plot air temp and wet-bulb
+        ax.plot(times, t2m_daily.values, color='#e07b54', alpha=0.7,
+                lw=0.8, label='T2M (daily mean)')
+        ax.plot(times, t2mwet_daily.values, color='#5b8fbc', alpha=0.9,
+                lw=1.0, label='T2MWET (daily mean)')
+        
+        # Risk threshold shading across full time axis
+        ax.axhspan(25, 28, alpha=0.12, color='orange', label='Moderate (25-28°C)')
+        ax.axhspan(28, 30, alpha=0.12, color='red', label='High (28-30°C)')
+        ax.axhspan(30, 50, alpha=0.12, color='darkred', label='Extreme (≥30°C)')
+        
+        # Threshold lines
+        ax.axhline(25, color='orange', ls=':', lw=0.8, alpha=0.7)
+        ax.axhline(28, color='red', ls=':', lw=0.8, alpha=0.7)
+        
+        ax.set_ylabel('Temperature (°C)')
+        ax.set_title(f'{city} ({data["desc"]}) — '
+                     f'{data["lat_actual"]:.1f}°N, {data["lon_actual"]:.1f}°E',
+                     fontsize=12, fontweight='bold')
+        
+        if i == 0:
+            ax.legend(fontsize=8, loc='upper right', ncol=3)
+        
+        ax.set_ylim(bottom=min(0, float(t2mwet_daily.min()) - 2))
+        ax.grid(axis='y', alpha=0.2)
+    
+    # Format x-axis
+    axes[-1].xaxis.set_major_locator(mdates.MonthLocator())
+    axes[-1].xaxis.set_major_formatter(mdates.DateFormatter('%b'))
+    axes[-1].set_xlabel('Month (2024)')
+    
+    plt.suptitle('City-Level Seasonal Temperature and Wet-Bulb Profiles — 2024',
+                 fontsize=14, y=1.01)
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=200, bbox_inches='tight')
+    plt.show()
+
+
+def plot_city_risk_hours(city_data, moderate_thresh=25, high_thresh=28, save_path=None):
+    """
+    For each city, compute and plot monthly hours in Moderate+ and High+ risk.
+    4-panel bar charts.
+    """
+    cities = list(city_data.keys())
+    n_cities = len(cities)
+    
+    fig, axes = plt.subplots(n_cities, 1, figsize=(12, 3 * n_cities), sharex=True)
+    if n_cities == 1:
+        axes = [axes]
+    
+    month_labels = [calendar.month_abbr[m] for m in range(1, 13)]
+    x = np.arange(12)
+    width = 0.35
+    
+    for i, (city, data) in enumerate(city_data.items()):
+        ax = axes[i]
+        
+        t2mwet = data['t2mwet']
+        months = t2mwet.time.dt.month.values
+        
+        # Total hours in each risk band per month
+        mod_plus = (t2mwet.values >= moderate_thresh)
+        high_plus = (t2mwet.values >= high_thresh)
+        
+        monthly_mod = [mod_plus[months == m].sum() for m in range(1, 13)]
+        monthly_high = [high_plus[months == m].sum() for m in range(1, 13)]
+        
+        ax.bar(x - width/2, monthly_mod, width, label='Hours ≥25°C',
+               color='#FFA500', alpha=0.8)
+        ax.bar(x + width/2, monthly_high, width, label='Hours ≥28°C',
+               color='#FF4500', alpha=0.8)
+        
+        ax.set_ylabel('Total Hours')
+        ax.set_title(f'{city}', fontsize=11, fontweight='bold')
+        ax.grid(axis='y', alpha=0.2)
+        
+        if i == 0:
+            ax.legend(fontsize=9)
+    
+    axes[-1].set_xticks(x)
+    axes[-1].set_xticklabels(month_labels)
+    axes[-1].set_xlabel('Month (2024)')
+    
+    plt.suptitle('Monthly Hours of Heat-Risk Exposure by City — 2024',
+                 fontsize=14, y=1.01)
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=200, bbox_inches='tight')
+    plt.show()
+
+
+def print_city_summary(city_data, moderate_thresh=25, high_thresh=28):
+    """
+    Print summary statistics for each city.
+    """
+    print(f"\n{'='*70}")
+    print(f"{'City':<12} {'Mean T2M':>10} {'Mean TWET':>10} {'P95 TWET':>10} "
+          f"{'Max TWET':>10} {'Hrs≥25°C':>10} {'Hrs≥28°C':>10}")
+    print(f"{'='*70}")
+    
+    for city, data in city_data.items():
+        t2m = data['t2m'].values
+        tw = data['t2mwet'].values
+        
+        mean_t2m = np.nanmean(t2m)
+        mean_tw = np.nanmean(tw)
+        p95_tw = np.nanpercentile(tw, 95)
+        max_tw = np.nanmax(tw)
+        hrs_mod = np.sum(tw >= moderate_thresh)
+        hrs_high = np.sum(tw >= high_thresh)
+        
+        print(f"{city:<12} {mean_t2m:>9.1f}° {mean_tw:>9.1f}° {p95_tw:>9.1f}° "
+              f"{max_tw:>9.1f}° {hrs_mod:>10,} {hrs_high:>10,}")
+    
+    print(f"{'='*70}")
